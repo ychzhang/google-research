@@ -39,6 +39,7 @@ import jax
 from jax import random
 import jax.nn
 import jax.numpy as jnp
+import optax
 from ml_collections import config_flags
 import tensorflow.compat.v2 as tf
 
@@ -354,31 +355,32 @@ def main(argv):
   else:
     raise ValueError('The specified teacher model is not supported.')
 
-  model_state, params = variables.pop('params')
-  if hparams.optimizer == 'sgd':
-    optimizer = optim.Momentum(
-        beta=hparams.momentum, nesterov=True).create(params)
-  elif hparams.optimizer == 'adam':
-    optimizer = optim.Adam(
-        beta1=hparams.adam.beta1, beta2=hparams.adam.beta2).create(params)
-  else:
-    raise ValueError('Optimizer type is not supported.')
-  state = imagenet_train_utils.TrainState(
-      step=0,
-      optimizer=optimizer,
-      model_state=model_state,
-      dynamic_scale=dynamic_scale)
-  del params, model_state  # do not keep a copy of the initial model
-
-  state = restore_checkpoint(state)
-  step_offset = int(state.step)  # step_offset > 0 if restarting from checkpoint
-  state = jax_utils.replicate(state)
-
+  mutable_vars, params = variables.pop('params')
   base_learning_rate = hparams.base_learning_rate * batch_size / 256.
   learning_rate_fn = create_learning_rate_fn(base_learning_rate,
                                              steps_per_epoch,
                                              hparams.lr_scheduler,
                                              batch_size)
+  if hparams.optimizer == 'sgd':
+    tx = optax.sgd(learning_rate=learning_rate_fn,
+                   momentum=hparams.momentum,
+                   nesterov=True)
+  elif hparams.optimizer == 'adam':
+    tx = optax.adam(learning_rate=learning_rate_fn,
+                    b1=hparams.adam.beta1,
+                    b2=hparams.adam.beta2)
+  else:
+    raise ValueError('Optimizer type is not supported.')
+  state = imagenet_train_utils.TrainState.create(
+      params=params,
+      tx=tx,
+      mutable_vars=mutable_vars,
+      dynamic_scale=dynamic_scale)
+  #del params, model_state  # do not keep a copy of the initial model
+
+  state = restore_checkpoint(state)
+  step_offset = int(state.step)  # step_offset > 0 if restarting from checkpoint
+  state = jax_utils.replicate(state)
 
   p_train_step = jax.pmap(
       functools.partial(
@@ -412,7 +414,7 @@ def main(argv):
                                   quantize_weights)
 
     state_dict_summary = summary_utils.get_state_dict_summary(
-        state.model_state, state_dict_keys)
+        state.mutable_vars, state_dict_keys)
     state_dict_summary_all.append(state_dict_summary)
 
     epoch_metrics.append(metrics)
